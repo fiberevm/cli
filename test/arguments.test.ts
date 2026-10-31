@@ -108,6 +108,42 @@ describe("Fiber CLI arguments", () => {
     ).toThrow("--chain is only valid for private-key");
   });
 
+  it("parses an eth_getLogs chunk size for private asset scans", () => {
+    expect(
+      parseCliArguments([
+        "private-assets",
+        "--file",
+        "backup.fiberseed",
+        "--rpc-url",
+        "https://rpc.example",
+        "--chunk",
+        "100",
+      ]),
+    ).toMatchObject({ command: "private-assets", chunkSize: 100 });
+    expect(
+      parseCliArguments(["private-assets", "--file=b", "--rpc-url=https://rpc.example", "--chunk=250"]),
+    ).toMatchObject({ chunkSize: 250 });
+  });
+
+  it("rejects invalid chunk sizes and chunks on key recovery", () => {
+    for (const value of ["0", "-5", "1.5", "1e2", "abc", "1000001"]) {
+      expect(() =>
+        parseCliArguments([
+          "private-assets",
+          "--file",
+          "backup.fiberseed",
+          "--rpc-url",
+          "https://rpc.example",
+          "--chunk",
+          value,
+        ]),
+      ).toThrow("--chunk must be an integer from 1 through 1000000");
+    }
+    expect(() =>
+      parseCliArguments(["private-key", "--file", "backup.fiberseed", "--chunk", "100"]),
+    ).toThrow("--chunk is only valid for private-assets");
+  });
+
   it("accepts --flag=value and still rejects inline passwords", () => {
     expect(
       parseCliArguments(["private-key", "--file=backup.fiberseed", "--chain=solana"]),

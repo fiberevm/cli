@@ -14,6 +14,8 @@ export type PrivateAssetsCommand = {
   command: "private-assets";
   file: string;
   rpcUrl: string;
+  /** Largest eth_getLogs block span; omitted, the scan learns the RPC's limit. */
+  chunkSize?: number;
   passwordStdin: boolean;
   json: boolean;
 };
@@ -29,6 +31,7 @@ export type CliCommand =
 /** Caps one range so a typo cannot print thousands of live keys. */
 export const MAX_DERIVATION_RANGE = 100;
 const MAX_DERIVATION_INDEX = 2 ** 31 - 1;
+export const MAX_CHUNK_SIZE = 1_000_000;
 
 const BOOLEAN_FLAGS = new Set(["--password-stdin", "--json"]);
 
@@ -37,7 +40,7 @@ export const HELP_TEXT = `Fiber wallet recovery CLI
 Usage:
   fiber private-key --file <backup.fiberseed> [--chain <evm|solana>] [--derivation-index <index|start-end>]
                     [--json] [--output <file>] [--password-stdin]
-  fiber private-assets --file <backup.fiberseed> --rpc-url <url> [--json] [--password-stdin]
+  fiber private-assets --file <backup.fiberseed> --rpc-url <url> [--chunk <blocks>] [--json] [--password-stdin]
   fiber help [private-key|private-assets]
   fiber --version
 
@@ -81,6 +84,9 @@ Scans the selected RPC's chain for spendable private ERC-20, ERC-721, and ERC-11
 Options:
   --file <path>         The .fiberseed export to decrypt. Required.
   --rpc-url <url>       http or https RPC for the chain to scan. Required; there is no default.
+  --chunk <blocks>      Largest eth_getLogs block range per request, from 1 through ${MAX_CHUNK_SIZE}
+                        (for example 100 on free RPCs). Without it, the scan halves the range
+                        whenever the RPC rejects it.
   --json                Print the scan result as JSON.
   --password-stdin      Read the export password from the first line of stdin.
 `;
@@ -153,6 +159,7 @@ export function parseCliArguments(args: string[]): CliCommand {
   let file: string | undefined;
   let rpcUrl: string | undefined;
   let output: string | undefined;
+  let chunkSize: number | undefined;
   let derivationIndexes = [0];
   let derivationIndexWasSet = false;
   let chain: FiberKeyNetwork = "evm";
@@ -202,6 +209,11 @@ export function parseCliArguments(args: string[]): CliCommand {
       derivationIndexWasSet = true;
     } else if (flag === "--output") {
       output = value;
+    } else if (flag === "--chunk") {
+      chunkSize = /^\d+$/.test(value) ? Number(value) : Number.NaN;
+      if (!Number.isSafeInteger(chunkSize) || chunkSize < 1 || chunkSize > MAX_CHUNK_SIZE) {
+        throw new Error(`--chunk must be an integer from 1 through ${MAX_CHUNK_SIZE}`);
+      }
     } else {
       throw new Error(`Unknown option: ${flag}`);
     }
@@ -213,6 +225,7 @@ export function parseCliArguments(args: string[]): CliCommand {
 
   if (command === "private-key") {
     if (rpcUrl) throw new Error("--rpc-url is only valid for private-assets");
+    if (chunkSize !== undefined) throw new Error("--chunk is only valid for private-assets");
     return {
       command,
       file,
@@ -242,5 +255,12 @@ export function parseCliArguments(args: string[]): CliCommand {
   if (output !== undefined) {
     throw new Error("--output is only valid for private-key");
   }
-  return { command, file, rpcUrl, passwordStdin, json };
+  return {
+    command,
+    file,
+    rpcUrl,
+    ...(chunkSize === undefined ? {} : { chunkSize }),
+    passwordStdin,
+    json,
+  };
 }

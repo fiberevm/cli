@@ -98,7 +98,23 @@ bun src/index.ts private-assets \
 
 There is intentionally no default RPC URL. The CLI does not read one from an environment variable and does not fall back to a public provider. It detects the chain with `eth_chainId`, verifies that Railgun supports it, then scans from that network's deployment block through the supplied RPC only. A first scan can take time. The result is only as trustworthy as the RPC, so use a provider you trust.
 
-The RPC must answer `eth_getLogs` for 5,000-block ranges all the way back to the pool's deployment block. Many free public RPCs refuse these historical queries. If the RPC can't serve the full history, the scan stops with an error rather than showing incomplete balances.
+The RPC must answer `eth_getLogs` all the way back to the pool's deployment block. Many free public RPCs refuse these historical queries. If the RPC can't serve the full history, the scan stops with an error rather than showing incomplete balances.
+
+Some free plans do serve the full history but limit each query instead:
+
+- **Block range per query.** Some free plans reject ranges far below the 5,000 blocks the scanner requests at a time, sometimes with an error message that names a larger limit than they actually accept. In testing, a free Base plan accepted only about 100 blocks per query.
+- **Rate limits.** Free plans throttle requests per second or per day, and a full scan sends many queries.
+
+The scan handles both. Without options, it starts with the scanner's normal ranges. Whenever the RPC rejects a range, it halves it and continues. It also retries rate-limited and transient failures with exponential backoff. `--chunk <blocks>` caps every `eth_getLogs` query from the start, which avoids those rejected queries on a plan with a known limit:
+
+```bash
+bun src/index.ts private-assets \
+  --file ./backup.fiberseed \
+  --rpc-url https://your-rpc.example \
+  --chunk 100
+```
+
+Small ranges mean many more requests. A full Base scan at 100 blocks per query can take hours on a free plan, so a paid or self-hosted RPC is much faster.
 
 Run the command once with the RPC for each chain you need to inspect. Fiber's own private pools are on Ethereum, BNB Smart Chain, Base, Arbitrum, and Sepolia, and the CLI scans each one from the block where Fiber deployed it. On Polygon it scans Railgun's own pool, which the same seed can also hold assets in. The other networks have no private pool to scan. Recover funds there with `private-key`.
 

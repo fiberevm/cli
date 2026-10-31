@@ -15,6 +15,7 @@ export type CliDependencies = {
   scanPrivateAssets: (input: {
     seed: Uint8Array;
     rpcUrl: string;
+    chunkSize?: number;
     onProgress: (message: string) => void;
   }) => Promise<PrivateAssetScan>;
   writeSecretFile: (file: string, contents: string) => Promise<void>;
@@ -164,6 +165,7 @@ export async function runCli(
       const scan = await dependencies.scanPrivateAssets({
         seed,
         rpcUrl: parsed.rpcUrl,
+        chunkSize: parsed.chunkSize,
         onProgress: (message) => dependencies.stderr.write(`${message}\n`),
       });
       writePrivateAssets(scan, parsed.json, dependencies.stdout);

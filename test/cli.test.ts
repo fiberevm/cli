@@ -211,6 +211,24 @@ describe("Fiber CLI commands", () => {
     expect(receivedRpcUrl).toBe("https://base.example");
     expect(stdout()).toContain("No private assets found");
   });
+
+  it("passes --chunk into the scan", async () => {
+    let receivedChunkSize: number | undefined;
+    const { dependencies } = keyDependencies(new Uint8Array(32), {
+      readSeed: async () => new Uint8Array(32).fill(0x11),
+      scanPrivateAssets: async ({ chunkSize }) => {
+        receivedChunkSize = chunkSize;
+        return { chainId: 8453, network: "Base", assets: [] };
+      },
+    });
+    const exitCode = await runCli(
+      ["private-assets", "--file", "backup.fiberseed", "--rpc-url", "https://base.example", "--chunk", "100"],
+      dependencies,
+    );
+
+    expect(exitCode).toBe(0);
+    expect(receivedChunkSize).toBe(100);
+  });
 });
 
 describe("secret output files", () => {

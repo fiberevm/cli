@@ -2,7 +2,6 @@ import { randomBytes } from "node:crypto";
 import {
   EngineEvent,
   MerkletreeScanStatus,
-  PollingJsonRpcProvider,
   RailgunEngine,
   TokenType,
   TXIDVersion,
@@ -16,6 +15,7 @@ import { entropyToMnemonic } from "@scure/bip39";
 import { wordlist } from "@scure/bip39/wordlists/english.js";
 import memdown from "memdown";
 import { getFiberEvmChain, getFiberPrivateDeployment } from "./chains.ts";
+import { LogRangeProvider, isRangeLimitError } from "./log-range-provider.ts";
 
 export type PrivateAsset = {
   type: "ERC20" | "ERC721" | "ERC1155";
@@ -155,23 +155,65 @@ export function aggregatePrivateAssets(
 }
 
 /**
+ * Says why a history scan stopped: an RPC that rejects the block range needs a smaller --chunk,
+ * while one that answers recent blocks but refuses old ones keeps no history, and --chunk cannot help.
+ */
+async function explainIncompleteScan(
+  provider: LogRangeProvider,
+  poolAddress: string,
+  deploymentBlock: number,
+): Promise<string> {
+  const failure = provider.lastLogFailure;
+  if (failure?.rpcError && isRangeLimitError(failure.rpcError)) {
+    return "The RPC rejected the eth_getLogs block range; retry with a smaller --chunk (for example --chunk 100).";
+  }
+  if (failure) {
+    let servesRecentLogs = false;
+    try {
+      const latest = await provider.getBlockNumber();
+      await provider.send("eth_getLogs", [
+        { address: poolAddress, fromBlock: `0x${Math.max(0, latest - 9).toString(16)}`, toBlock: `0x${latest.toString(16)}` },
+      ]);
+      servesRecentLogs = true;
+    } catch {
+      // The RPC refuses even recent logs; fall through to the general advice.
+    }
+    if (servesRecentLogs) {
+      const reason = failure.rpcError ? ` (${failure.rpcError.message.slice(0, 160)})` : "";
+      return (
+        `The RPC answers eth_getLogs for recent blocks but refused block ${failure.fromBlock}${reason}, ` +
+        "so it does not serve the pool's older logs and a smaller --chunk will not help. " +
+        `Use an RPC that serves eth_getLogs back to block ${deploymentBlock}; many free plans keep only recent logs.`
+      );
+    }
+  }
+  return (
+    "Use an RPC that serves eth_getLogs back to the pool's deployment; many free public RPCs refuse this. " +
+    "If the RPC only limits the block range, retry with a smaller --chunk (for example --chunk 100)."
+  );
+}
+
+/**
  * Reconstructs Fiber's Railgun wallet and scans private holdings through one explicit RPC.
- * It accepts decrypted seed bytes, the RPC URL, and an optional progress sink for stderr.
+ * It accepts decrypted seed bytes, the RPC URL, an optional eth_getLogs block span, and an
+ * optional progress sink for stderr.
  */
 export async function listPrivateAssets({
   seed,
   rpcUrl,
+  chunkSize,
   onProgress = () => undefined,
 }: {
   seed: Uint8Array;
   rpcUrl: string;
+  chunkSize?: number;
   onProgress?: (message: string) => void;
 }): Promise<PrivateAssetScan> {
   const chainId = await getRpcChainId(rpcUrl);
   const network = getRailgunNetwork(chainId);
   const encryptionKeyBytes = randomBytes(32);
   let engine: RailgunEngine | undefined;
-  let provider: PollingJsonRpcProvider | undefined;
+  let provider: LogRangeProvider | undefined;
 
   try {
     const unavailableArtifacts = {
@@ -199,7 +241,12 @@ export async function listPrivateAssets({
     );
 
     onProgress(`Scanning ${network.publicName} through the supplied RPC; the first scan can take time...`);
-    provider = new PollingJsonRpcProvider(rpcUrl, chainId, 10_000);
+    // Free RPCs often cap eth_getLogs ranges and rate-limit requests; this provider splits and retries.
+    provider = new LogRangeProvider(rpcUrl, chainId, 10_000, {
+      maxBlockRange: chunkSize,
+      onRangeReduced: (blocks) =>
+        onProgress(`The RPC limits eth_getLogs ranges; continuing with ${blocks}-block queries...`),
+    });
     const deploymentBlocks = {
       [TXIDVersion.V2_PoseidonMerkle]: network.deploymentBlock,
       [TXIDVersion.V3_PoseidonMerkle]:
@@ -263,7 +310,7 @@ export async function listPrivateAssets({
     if (scanIncomplete || scannedVersions.some((version) => !completedVersions.has(version))) {
       throw new IncompletePrivateAssetScanError(
         `Private asset scan on ${network.publicName} stopped before reading the pool's full history, so no balances are shown. ` +
-          "Use an RPC that serves eth_getLogs for 5,000-block ranges back to the pool's deployment; many free public RPCs refuse this.",
+          (await explainIncompleteScan(provider, network.proxyContract, network.deploymentBlock)),
       );
     }
 
