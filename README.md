@@ -1,5 +1,8 @@
 # Fiber CLI
 
+> [!WARNING]
+> **This CLI is deprecated.** Use [recovery.fiber.so](https://recovery.fiber.so) instead. Its source is at [github.com/fiberevm/recovery](https://github.com/fiberevm/recovery). This repository is no longer maintained, and the instructions below are kept for reference only.
+
 ![Fiber mobile and desktop apps — The Stablecoin Neobank](./assets/fiber-stablecoin-neobank.png)
 
 Fiber CLI is a public recovery tool for password-encrypted Fiber `.fiberseed` exports. It can:
