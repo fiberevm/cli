@@ -5,6 +5,7 @@ import { getHelpText, parseCliArguments, type PrivateKeyCommand } from "./argume
 import { readHiddenPassword, readPasswordFromStdin } from "./password.ts";
 import type { PrivateAssetScan } from "./private-assets.ts";
 import { deriveKey, type DerivedKey } from "./private-key.ts";
+import type { RecoverInput, RecoverOutcome } from "./recover.ts";
 import { readWalletSeed } from "./wallet-file.ts";
 
 type Output = Pick<NodeJS.WriteStream, "write">;
@@ -15,14 +16,19 @@ export type CliDependencies = {
   scanPrivateAssets: (input: {
     seed: Uint8Array;
     rpcUrl: string;
+    chunkSize?: number;
     onProgress: (message: string) => void;
   }) => Promise<PrivateAssetScan>;
   writeSecretFile: (file: string, contents: string) => Promise<void>;
+  /** Defaults to the real recover command; tests inject a stub. */
+  recover?: (input: RecoverInput) => Promise<RecoverOutcome>;
+  /** Defaults to the terminal CONFIRM prompt. */
+  confirm?: () => Promise<boolean>;
   stdout: Output;
   stderr: Output;
 };
 
-const defaultDependencies: CliDependencies = {
+const defaultDependencies: Required<CliDependencies> = {
   readPassword: (fromStdin) => (fromStdin ? readPasswordFromStdin() : readHiddenPassword()),
   readSeed: readWalletSeed,
   scanPrivateAssets: async (input) => {
@@ -31,6 +37,15 @@ const defaultDependencies: CliDependencies = {
     return listPrivateAssets(input);
   },
   writeSecretFile,
+  recover: async (input) => {
+    // Like the scan, the prover and signing code load only when recover runs.
+    const { runRecovery } = await import("./recover.ts");
+    return runRecovery(input);
+  },
+  confirm: async () => {
+    const { askForConfirmation } = await import("./transaction-guards.ts");
+    return askForConfirmation();
+  },
   stdout,
   stderr,
 };
@@ -161,9 +176,30 @@ export async function runCli(
         return 0;
       }
 
+      if (parsed.command === "recover") {
+        const recover = dependencies.recover ?? defaultDependencies.recover;
+        const outcome = await recover({
+          seed,
+          rpcUrl: parsed.rpcUrl,
+          chunkSize: parsed.chunkSize,
+          token: parsed.token,
+          amount: parsed.amount,
+          derivationIndex: parsed.derivationIndex,
+          redeemTo: parsed.redeemTo,
+          artifactsDirectory: parsed.artifactsDirectory,
+          dryRun: parsed.dryRun,
+          confirm: dependencies.confirm ?? defaultDependencies.confirm,
+          onProgress: (message) => dependencies.stderr.write(`${message}\n`),
+          output: (line) => dependencies.stdout.write(`${line}\n`),
+        });
+        // A cancelled confirmation is not a successful recovery.
+        return outcome === "cancelled" ? 1 : 0;
+      }
+
       const scan = await dependencies.scanPrivateAssets({
         seed,
         rpcUrl: parsed.rpcUrl,
+        chunkSize: parsed.chunkSize,
         onProgress: (message) => dependencies.stderr.write(`${message}\n`),
       });
       writePrivateAssets(scan, parsed.json, dependencies.stdout);

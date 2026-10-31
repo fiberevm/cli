@@ -1,3 +1,4 @@
+import { getAddress } from "ethers/address";
 import type { FiberKeyNetwork } from "./chains.ts";
 
 export type PrivateKeyCommand = {
@@ -14,37 +15,63 @@ export type PrivateAssetsCommand = {
   command: "private-assets";
   file: string;
   rpcUrl: string;
+  /** Largest eth_getLogs block span; omitted, the scan learns the RPC's limit. */
+  chunkSize?: number;
   passwordStdin: boolean;
   json: boolean;
 };
 
-export type HelpTopic = "private-key" | "private-assets";
+export type RecoverCommand = {
+  command: "recover";
+  file: string;
+  rpcUrl: string;
+  chunkSize?: number;
+  /** ERC-20 to unshield from the private balance. */
+  token: string;
+  /** Raw amount; undefined unshields the whole spendable balance. */
+  amount?: bigint;
+  /** EVM account that receives the unshield, signs, and pays gas. Always explicit. */
+  derivationIndex: number;
+  /** When set, --token is an ERC-4626 vault and its shares are redeemed to this address. */
+  redeemTo?: string;
+  artifactsDirectory?: string;
+  dryRun: boolean;
+  /** Always false: the confirmation prompt needs the terminal's stdin. */
+  passwordStdin: false;
+};
+
+export type HelpTopic = "private-key" | "private-assets" | "recover";
 
 export type CliCommand =
   | PrivateKeyCommand
   | PrivateAssetsCommand
+  | RecoverCommand
   | { command: "help"; topic?: HelpTopic }
   | { command: "version" };
 
 /** Caps one range so a typo cannot print thousands of live keys. */
 export const MAX_DERIVATION_RANGE = 100;
 const MAX_DERIVATION_INDEX = 2 ** 31 - 1;
+export const MAX_CHUNK_SIZE = 1_000_000;
 
-const BOOLEAN_FLAGS = new Set(["--password-stdin", "--json"]);
+const BOOLEAN_FLAGS = new Set(["--password-stdin", "--json", "--dry-run"]);
 
 export const HELP_TEXT = `Fiber wallet recovery CLI
 
 Usage:
   fiber private-key --file <backup.fiberseed> [--chain <evm|solana>] [--derivation-index <index|start-end>]
                     [--json] [--output <file>] [--password-stdin]
-  fiber private-assets --file <backup.fiberseed> --rpc-url <url> [--json] [--password-stdin]
-  fiber help [private-key|private-assets]
+  fiber private-assets --file <backup.fiberseed> --rpc-url <url> [--chunk <blocks>] [--json] [--password-stdin]
+  fiber recover --file <backup.fiberseed> --rpc-url <url> --token <address> --derivation-index <index>
+                [--amount <raw>] [--redeem-to <address>] [--artifacts-dir <dir>] [--chunk <blocks>] [--dry-run]
+  fiber help [private-key|private-assets|recover]
   fiber --version
 
 Security:
   Every file operation requires a password through a hidden prompt or stdin.
   Passwords are never accepted as a command-line value.
-  private-assets has no default RPC URL and never reads one from the environment.
+  private-assets and recover have no default RPC URL and never read one from the environment.
+  recover SIGNS AND SENDS TRANSACTIONS, and only after you type CONFIRM.
 
 Run "fiber <command> --help" for command details.
 `;
@@ -81,14 +108,52 @@ Scans the selected RPC's chain for spendable private ERC-20, ERC-721, and ERC-11
 Options:
   --file <path>         The .fiberseed export to decrypt. Required.
   --rpc-url <url>       http or https RPC for the chain to scan. Required; there is no default.
+  --chunk <blocks>      Largest eth_getLogs block range per request, from 1 through ${MAX_CHUNK_SIZE}
+                        (for example 100 on free RPCs). Without it, the scan halves the range
+                        whenever the RPC rejects it.
   --json                Print the scan result as JSON.
   --password-stdin      Read the export password from the first line of stdin.
+`;
+
+export const RECOVER_HELP_TEXT = `Usage:
+  fiber recover --file <backup.fiberseed> --rpc-url <url> --token <address> --derivation-index <index> [options]
+
+SIGNS AND SENDS TRANSACTIONS. Unshields --token from the private balance to the EVM account at
+--derivation-index, which signs and pays gas. With --redeem-to, --token must be an ERC-4626 vault:
+after the unshield confirms, its shares are redeemed and the underlying asset goes to --redeem-to.
+
+Before anything is signed it verifies Railgun's proof artifacts against Railgun's published hashes
+and the pool's on-chain verifying keys, verifies the proof locally, simulates every step with
+eth_simulateV1, prints the plan, and waits until you type CONFIRM. Available on Base.
+
+Options:
+  --file <path>              The .fiberseed export to decrypt. Required.
+  --rpc-url <url>            http or https RPC that supports eth_simulateV1. Required; there is no default.
+  --token <address>          ERC-20 (or ERC-4626 vault share) to unshield. Required.
+  --derivation-index <n>     EVM account that receives the unshield, signs, and pays gas. Required.
+                             Fiber's own accounts start at index 1; see "fiber private-key --help".
+                             Prefer an index Fiber is not actively using (see below).
+  --amount <raw>             Raw integer amount. Defaults to the whole spendable balance.
+  --redeem-to <address>      Redeem the unshielded vault shares and send the underlying asset here.
+  --artifacts-dir <dir>      Keep verified proof artifacts between runs; they are re-verified each time.
+  --chunk <blocks>           Largest eth_getLogs block range per request, as for private-assets.
+  --dry-run                  Stop after printing the plan. Nothing is signed or sent.
+
+Choosing the account:
+  Fiber's backend can treat tokens that arrive at one of its deposit or routing addresses as a new
+  deposit and move them back into the vault or the private balance, possibly before the redeem.
+  Use an index Fiber is not actively using. recover sends the redeem right after the unshield's first
+  confirmation to keep that window short. If the tokens are re-deposited anyway, nothing is lost:
+  they show up again in private-assets, and you can run recover again.
+
+The password must come from the hidden prompt, because the confirmation also reads the terminal.
 `;
 
 /** Returns the help text for the general usage or one command. */
 export function getHelpText(topic?: HelpTopic): string {
   if (topic === "private-key") return PRIVATE_KEY_HELP_TEXT;
   if (topic === "private-assets") return PRIVATE_ASSETS_HELP_TEXT;
+  if (topic === "recover") return RECOVER_HELP_TEXT;
   return HELP_TEXT;
 }
 
@@ -97,7 +162,15 @@ function isHelpFlag(argument: string): boolean {
 }
 
 function isCommand(argument: string | undefined): argument is HelpTopic {
-  return argument === "private-key" || argument === "private-assets";
+  return argument === "private-key" || argument === "private-assets" || argument === "recover";
+}
+
+function parseAddress(flag: string, value: string): string {
+  try {
+    return getAddress(value);
+  } catch {
+    throw new Error(`${flag} must be an EVM address with a valid checksum`);
+  }
 }
 
 /** Parses one index or an inclusive start-end range into the account indexes to derive. */
@@ -153,12 +226,18 @@ export function parseCliArguments(args: string[]): CliCommand {
   let file: string | undefined;
   let rpcUrl: string | undefined;
   let output: string | undefined;
+  let chunkSize: number | undefined;
   let derivationIndexes = [0];
   let derivationIndexWasSet = false;
   let chain: FiberKeyNetwork = "evm";
   let chainWasSet = false;
   let passwordStdin = false;
   let json = false;
+  let dryRun = false;
+  let tokenAddress: string | undefined;
+  let amount: bigint | undefined;
+  let redeemTo: string | undefined;
+  let artifactsDirectory: string | undefined;
 
   for (let index = 1; index < args.length; index += 1) {
     const argument = args[index]!;
@@ -172,6 +251,7 @@ export function parseCliArguments(args: string[]): CliCommand {
     if (BOOLEAN_FLAGS.has(flag)) {
       if (inlineValue !== undefined) throw new Error(`${flag} does not take a value`);
       if (flag === "--password-stdin") passwordStdin = true;
+      else if (flag === "--dry-run") dryRun = true;
       else json = true;
       continue;
     }
@@ -202,6 +282,22 @@ export function parseCliArguments(args: string[]): CliCommand {
       derivationIndexWasSet = true;
     } else if (flag === "--output") {
       output = value;
+    } else if (flag === "--chunk") {
+      chunkSize = /^\d+$/.test(value) ? Number(value) : Number.NaN;
+      if (!Number.isSafeInteger(chunkSize) || chunkSize < 1 || chunkSize > MAX_CHUNK_SIZE) {
+        throw new Error(`--chunk must be an integer from 1 through ${MAX_CHUNK_SIZE}`);
+      }
+    } else if (flag === "--token") {
+      tokenAddress = parseAddress(flag, value);
+    } else if (flag === "--amount") {
+      if (!/^\d+$/.test(value) || BigInt(value) === 0n) {
+        throw new Error("--amount must be a positive integer in the token's smallest unit");
+      }
+      amount = BigInt(value);
+    } else if (flag === "--redeem-to") {
+      redeemTo = parseAddress(flag, value);
+    } else if (flag === "--artifacts-dir") {
+      artifactsDirectory = value;
     } else {
       throw new Error(`Unknown option: ${flag}`);
     }
@@ -210,9 +306,21 @@ export function parseCliArguments(args: string[]): CliCommand {
   if (!file) {
     throw new Error("--file is required");
   }
+  if (command !== "recover") {
+    for (const [flag, used] of [
+      ["--token", tokenAddress !== undefined],
+      ["--amount", amount !== undefined],
+      ["--redeem-to", redeemTo !== undefined],
+      ["--artifacts-dir", artifactsDirectory !== undefined],
+      ["--dry-run", dryRun],
+    ] as const) {
+      if (used) throw new Error(`${flag} is only valid for recover`);
+    }
+  }
 
   if (command === "private-key") {
-    if (rpcUrl) throw new Error("--rpc-url is only valid for private-assets");
+    if (rpcUrl) throw new Error("--rpc-url is only valid for private-assets and recover");
+    if (chunkSize !== undefined) throw new Error("--chunk is only valid for private-assets and recover");
     return {
       command,
       file,
@@ -225,7 +333,7 @@ export function parseCliArguments(args: string[]): CliCommand {
   }
 
   if (!rpcUrl) {
-    throw new Error("--rpc-url is required for private-assets; there is no default RPC URL");
+    throw new Error(`--rpc-url is required for ${command}; there is no default RPC URL`);
   }
   try {
     const parsedRpcUrl = new URL(rpcUrl);
@@ -233,14 +341,50 @@ export function parseCliArguments(args: string[]): CliCommand {
   } catch {
     throw new Error("--rpc-url must be a valid http or https URL");
   }
-  if (derivationIndexWasSet) {
-    throw new Error("--derivation-index is only valid for private-key");
-  }
   if (chainWasSet) {
     throw new Error("--chain is only valid for private-key");
   }
   if (output !== undefined) {
     throw new Error("--output is only valid for private-key");
   }
-  return { command, file, rpcUrl, passwordStdin, json };
+
+  if (command === "recover") {
+    if (!tokenAddress) throw new Error("--token is required for recover");
+    // Fiber never uses index 0, so a default would silently pick an account that holds nothing.
+    if (!derivationIndexWasSet) {
+      throw new Error(
+        "--derivation-index is required for recover; Fiber's accounts start at 1 (find yours with private-key --derivation-index 1-20)",
+      );
+    }
+    if (derivationIndexes.length !== 1) throw new Error("--derivation-index must be a single index for recover");
+    if (json) throw new Error("--json is only valid for private-key and private-assets");
+    // The confirmation prompt reads the terminal, so the password cannot come from stdin.
+    if (passwordStdin) throw new Error("recover asks for confirmation on the terminal; use the hidden password prompt");
+    if (redeemTo?.toLowerCase() === tokenAddress.toLowerCase()) throw new Error("--redeem-to cannot be the vault itself");
+    return {
+      command,
+      file,
+      rpcUrl,
+      ...(chunkSize === undefined ? {} : { chunkSize }),
+      token: tokenAddress,
+      ...(amount === undefined ? {} : { amount }),
+      derivationIndex: derivationIndexes[0]!,
+      ...(redeemTo === undefined ? {} : { redeemTo }),
+      ...(artifactsDirectory === undefined ? {} : { artifactsDirectory }),
+      dryRun,
+      passwordStdin: false,
+    };
+  }
+
+  if (derivationIndexWasSet) {
+    throw new Error("--derivation-index is only valid for private-key and recover");
+  }
+  return {
+    command,
+    file,
+    rpcUrl,
+    ...(chunkSize === undefined ? {} : { chunkSize }),
+    passwordStdin,
+    json,
+  };
 }

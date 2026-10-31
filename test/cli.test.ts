@@ -211,6 +211,88 @@ describe("Fiber CLI commands", () => {
     expect(receivedRpcUrl).toBe("https://base.example");
     expect(stdout()).toContain("No private assets found");
   });
+
+  it("passes --chunk into the scan", async () => {
+    let receivedChunkSize: number | undefined;
+    const { dependencies } = keyDependencies(new Uint8Array(32), {
+      readSeed: async () => new Uint8Array(32).fill(0x11),
+      scanPrivateAssets: async ({ chunkSize }) => {
+        receivedChunkSize = chunkSize;
+        return { chainId: 8453, network: "Base", assets: [] };
+      },
+    });
+    const exitCode = await runCli(
+      ["private-assets", "--file", "backup.fiberseed", "--rpc-url", "https://base.example", "--chunk", "100"],
+      dependencies,
+    );
+
+    expect(exitCode).toBe(0);
+    expect(receivedChunkSize).toBe(100);
+  });
+
+  it("runs recover with the parsed options, then clears the seed", async () => {
+    const seed = new Uint8Array(32).fill(0x22);
+    let received: Parameters<NonNullable<CliDependencies["recover"]>>[0] | undefined;
+    const { dependencies, stdout } = keyDependencies(seed, {
+      readPassword: async (fromStdin) => {
+        expect(fromStdin).toBe(false);
+        return "correct horse battery staple";
+      },
+      recover: async (input) => {
+        received = input;
+        input.output("plan line");
+        return "completed";
+      },
+      confirm: async () => true,
+    });
+    const exitCode = await runCli(
+      [
+        "recover",
+        "--file",
+        "backup.fiberseed",
+        "--rpc-url",
+        "https://base.example",
+        "--token",
+        "0x00000000000000000000000000000000000000b2",
+        "--derivation-index",
+        "2",
+      ],
+      dependencies,
+    );
+
+    expect(exitCode).toBe(0);
+    expect(received).toMatchObject({
+      rpcUrl: "https://base.example",
+      token: "0x00000000000000000000000000000000000000b2",
+      derivationIndex: 2,
+      dryRun: false,
+    });
+    expect(stdout()).toBe("plan line\n");
+    expect(seed.every((byte) => byte === 0)).toBe(true);
+  });
+
+  it("exits 1 when the recover confirmation is cancelled", async () => {
+    const { dependencies } = keyDependencies(new Uint8Array(32).fill(0x22), {
+      recover: async (input) => ((await input.confirm()) ? "completed" : "cancelled"),
+      confirm: async () => false,
+    });
+    const exitCode = await runCli(
+      [
+        "recover",
+        "--file",
+        "backup.fiberseed",
+        "--rpc-url",
+        "https://base.example",
+        "--token",
+        "0x00000000000000000000000000000000000000b2",
+        "--derivation-index",
+        "1",
+      ],
+      dependencies,
+    );
+
+    expect(exitCode).toBe(1);
+  });
 });
 
 describe("secret output files", () => {
